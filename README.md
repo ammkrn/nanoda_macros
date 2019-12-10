@@ -77,6 +77,13 @@ And "constant" items that are only ever inserted once and then get referenced by
 + False const reduction flag<br/>
 `UID #FLAGF`
 
++ EqShort definitional equality marker (this will be removed soon since it's no longer necessary)<br/>
+`UID #SSEQ`
+
++ NeqShort definitional equality marker (this will be removed soon since it's no longer necessary)<br/>
+`UID #SSNEQ`
+
+
 + Unit (this was needed for us to be generic over function return values, since some of the functions
 you may want to trace have no return value)<br/>
 `UID #UNIT`

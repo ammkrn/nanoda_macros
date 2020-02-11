@@ -1,3 +1,9 @@
+#![allow(unused_parens)]
+#![allow(unused_mut)]
+#![allow(unused_variables)]
+#![allow(unused_imports)]
+#![allow(dead_code)]
+#![allow(unreachable_code)]
 extern crate proc_macro;
 use proc_macro::TokenStream;
 
@@ -6,536 +12,269 @@ use proc_macro2::Ident as Ident2;
 use quote::{ quote, format_ident };
 use syn::{ parse_macro_input, 
            parse_quote, 
+           parse::Parse,
+           parse::ParseStream,
+           parse::Result,
            visit_mut::VisitMut, 
            ItemFn, 
+           punctuated::Punctuated,
            Stmt };
 
 mod helpers;
+mod step_derive;
 
-fn get_default_blacklist() -> Vec<syn::Path> {
-        vec![
-            parse_quote!(OffsetCache),
-            parse_quote!(expr::OffsetCache),
-            parse_quote!(crate::expr::OffsetCache),
-            parse_quote!(Arc<RwLock<Env>>),
-            parse_quote!(sync::Arc<RwLock<Env>>),
-            parse_quote!(std::sync::Arc<RwLock<Env>>),
-            parse_quote!(std::sync::Arc<lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, env::Env>>),
-            parse_quote!(Env),
-            parse_quote!(env::Env),
-            parse_quote!(crate::env::Env),
-            parse_quote!(TypeChecker),
-            parse_quote!(tc::TypeChecker),
-            parse_quote!(crate::tc::TypeChecker),
-            parse_quote!(CompiledModification),
-            parse_quote!(env::CompiledModification),
-            parse_quote!(crate::env::CompiledModification),
-            parse_quote!(ReductionCache),
-            parse_quote!(reduction::ReductionCache),
-            parse_quote!(crate::reduction::ReductionCache),
-        ]
+// The acceptable forms of `Step` type annotation.
+fn type_is_step(type_ : &syn::Type) -> bool {
+    let form1 : syn::Type = parse_quote!(Step);
+    let form2 : syn::Type = parse_quote!(trace::Step);
+    let form3 : syn::Type = parse_quote!(crate::trace::Step);
+
+       (type_ == &form1)
+    || (type_ == &form2)
+    || (type_ == &form3)
+
 }
 
+/*
+Safety check; ensure that either: 
+1. the `let this_step ...` local binding already has a type annotation of ` : Step `
+2. A type annotation of ` : Step` is added if it's not already there.
+*/
+fn step_declar_add_type(_stmt : &syn::Stmt) -> (syn::Ident, syn::Stmt) {
+    let full_step_type : syn::Type = parse_quote! {
+        crate::trace::Step
+    };
 
-/// For any function F decoarted with the #[tracing] attribute, we modify the 
-/// original function, and then create a new function called F_2__.
-struct TraceMacroState1 {
-    trace_items : HashSet<Ident2>,
-    type_blacklist : HashSet<syn::Path>,
-    item_name : Ident2,
-    fn_arg_infos : Vec<(syn::Pat, syn::Type, Ident2)>,
-    trace_self : bool
-}
+    match _stmt {
+        syn::Stmt::Local(local) => {
+            let mut init_copy = local.init.as_ref().clone();
 
-impl TraceMacroState1 {
-    pub fn new(trace_self : bool, trace_items : HashSet<Ident2>, _type_blacklist : Option<HashSet<syn::Path>>, f : &ItemFn) -> Self {
+            match &local.pat {
+                syn::Pat::Ident(syn::PatIdent { ident, .. }) => {
+                    let var_name = ident.clone();
+                    let init_val = local.init.clone();
+                    let mut new_stmt : syn::Stmt = parse_quote! {
+                        let #var_name : #full_step_type = panic!();
+                    };
 
+                    match new_stmt {
+                        syn::Stmt::Local(ref mut new_local) => {
+                            std::mem::replace(&mut new_local.attrs, local.attrs.clone());
+                            std::mem::replace(&mut new_local.init, local.init.clone());
+                            (var_name, new_stmt)
 
-        // used to tag the `Op` node as IE `whnf_core ...`
-        let item_name = f.sig.ident.clone();
-
-        // get the name and type of each of the function's arguments
-        // so we can add the code needed to trace them.
-        let fn_arg_infos = f.sig.inputs.iter().filter_map(|item| {
-            match item {
-                syn::FnArg::Typed(syn::PatType { pat, ty, .. }) => {
-                    match pat.as_ref() {
-                        syn::Pat::Ident(pat_ident) => {
-                            let lhs = pat.as_ref().clone();
-                            let rhs = pat_ident.ident.clone();
-                            Some((lhs, ty.as_ref().clone(), rhs))
-                        }
-                        _ => None
+                        },
+                        _ => panic!("nanoda_macros::step_declar_add_type, line {} : the variable `new_stmt` \
+                                     was not parsed as a syn::Stmt::Local. While not a big deal, this is \
+                                     probably not a user-serviceable
+                                     error, please report this to the author", line!())
                     }
                 },
-                _ => None
-            }
-        }).collect::<Vec<(syn::Pat, syn::Type, syn::Ident)>>();
-
-        let  blacklisted_types : Vec<syn::Path> = get_default_blacklist();
-
-        let type_blacklist = {
-            let mut set = _type_blacklist.unwrap_or_else(|| HashSet::new());
-            for elem in blacklisted_types {
-                set.insert(elem);
-            };
-            set
-        };
-
-        TraceMacroState1 {
-            trace_items,
-            type_blacklist,
-            item_name,
-            fn_arg_infos,
-            trace_self
-        }
-    }
-
-// The old function body becomes a block within the new tracing function.
-// that gets surrounded by the tracing stuff.
-
-    pub fn add_tracing_then_visit(&mut self, ifn : &mut syn::ItemFn) {
-        self.add_tracing(ifn);
-        self.visit_item_fn_mut(ifn);
-    }
-
-    pub fn add_tracing(&mut self, ifn : &mut syn::ItemFn) {
-        // For functions with `core` in their method name, we add 
-        // allow dead code, since in cases where both the parent and core 
-        // function are decorated with a tracing attribute, the core method
-        // will effectively become dead code (since the new tracing parent
-        // only ever calls the `_2__` method)
-        if ifn.sig.ident.to_string().contains("core") {
-            let allow_unused_attr : syn::Attribute = parse_quote! {
-                #[allow(dead_code)]
-            };
-            ifn.attrs.push(allow_unused_attr);
-        } 
-
-        // contents of old function block bound to a variable.
-        let inner_block = ifn.block.clone();
-        let inner_block_closure_local : syn::Stmt = parse_quote! {
-            let mut inner_block_closure__ = || #inner_block;
-        };
-
-
-        let mut outer_block_stmts = Vec::new();
-
-        let tracing_imports_stmts : syn::Item = syn::Item::Use(parse_quote! {
-            #[allow(unused_imports)]
-            use crate::tracing::{ TraceData, HasInsertItem };
-        });
-        outer_block_stmts.push(syn::Stmt::Item(tracing_imports_stmts));
-
-
-        let ident_literal = proc_macro2::Literal::string(&self.item_name.to_string());
-
-        // let self_ident = "whnf_core";
-        let self_ident_stmt : Stmt = parse_quote! {
-            let self_ident : &'static str = #ident_literal;
-        };
-        outer_block_stmts.push(self_ident_stmt);
-
-        let new_trace_data_stmt : syn::Stmt = parse_quote! {
-            let mut trace_data__ : crate::tracing::TraceData = crate::tracing::TraceData::new();
-        };
-        outer_block_stmts.push(new_trace_data_stmt);
-
-        // let new_root_op__ = trace_data__.new_root_op(self_idx);
-        let new_op_stmt : syn::Stmt = parse_quote! {
-            let mut this_op_idx__ : crate::tracing::OpIdx = trace_data__.new_root_op(self_ident);
-        };
-        outer_block_stmts.push(new_op_stmt);
-
-        // Op's parent is already set
-        let assert_parent_set_stmt : syn::Stmt = parse_quote! {
-            match trace_data__.get_current_parent_op() {
-                Some(x) if x == this_op_idx__ => (),
-                Some(y) => panic!("parent op's current parent was Some(x) where x != this_op_idx"),
-                None => panic!("should never have `None` parent op!")
-            }
-        };
-        outer_block_stmts.push(assert_parent_set_stmt.clone());
-
-        // make code to declare/insert function arguments and put them 
-        // in the Op's trace data.
-        // If the type is something in the blacklist (like offset_cache)
-        // don't trace it.
-
-        if self.trace_self {
-
-            let clone_ident = format_ident!("self_arg_clone__");
-            let item_idx_ident = format_ident!("self_arg_idx__");
-
-            let trace_self_stmt =  parse_quote! {
-                #[allow(unused_variables)]
-                let #item_idx_ident = {
-                    let #clone_ident = self;
-                    let #item_idx_ident = trace_data__.insert_item(#clone_ident);
-                    trace_data__.push_arg(this_op_idx__, #item_idx_ident);
-                    #item_idx_ident
-                };
-            };
-            outer_block_stmts.push(trace_self_stmt);
-        }
-
-        for (p, ty, id) in self.fn_arg_infos.clone().into_iter() {
-            if !(self.type_blacklist.contains(&crate::helpers::get_collect_type(&ty))) {
-               let as_stmt = crate::helpers::make_local_for_arg(p, id, &ty);
-               outer_block_stmts.push(as_stmt);
-            } else {
-                continue
-            }
-        }
-
-        // set op args, and set stmt to trace return value.
-        //unimplemented!();
-
-        outer_block_stmts.push(inner_block_closure_local);
-        let inner_block_result_stmt : syn::Stmt = parse_quote! {
-            let inner_block_result__1 = inner_block_closure__();
-        };
-        outer_block_stmts.push(inner_block_result_stmt);
-
-        outer_block_stmts.push(assert_parent_set_stmt);
-
-        let insert_ret_val_stmt : Stmt = parse_quote! {
-            let ret_val_idx__ = trace_data__.push_ret_val(this_op_idx__, inner_block_result__1.clone());
-        };
-        outer_block_stmts.push(insert_ret_val_stmt);
-
-
-        // Make a literal stmt of `inner_block_result__` that just returns whatever
-        // the `inner_block_result__` block got as a return value.
-        let return_result_path : syn::Expr = syn::Expr::Path(parse_quote!(inner_block_result__1));
-        outer_block_stmts.push(syn::Stmt::Expr(return_result_path));
-
-        std::mem::replace(&mut ifn.block.stmts, outer_block_stmts);
-    }
-}
-
-// The only node sorts we want to universally modify are function and method calls
-// to functions that are supposed to be tracing. We want to recursively walk the function
-// and change all occurences of those functions to be occurences of their tracing
-// version and add the trace_data__ as an argument.
-impl VisitMut for TraceMacroState1 {
-    fn visit_expr_call_mut(&mut self, b : &mut syn::ExprCall) {
-        match b.func.as_mut() {
-            syn::Expr::Path(expr_path) => {
-                let stock_fn_name = expr_path.path.segments.last().cloned().map(|x| x.ident).expect("visi_expr_call_mut got empty path segment");
-                if self.trace_items.contains(&stock_fn_name) {
-                    let new_fn_name = format_ident!("{}_2__", stock_fn_name);
-                    let tracer_arg : syn::ExprReference = parse_quote!(&mut trace_data__);
-                    let tracer_arg_as_expr : syn::Expr = syn::Expr::Reference(tracer_arg);
-
-                   // changes IE `crate::tc::whnf_core` to `crate::tc::whnf_core_2__`
-                    expr_path.path.segments.last_mut().map(|pseg| std::mem::replace(&mut pseg.ident, new_fn_name));
-                    b.args.push(tracer_arg_as_expr);
-
-                } else {
-                    // call to a method that's not supposed to be tracked.
-                    return
-                }
-            },
-            _ => unimplemented!("expected a path for method name in visit_expr_call_mut")
-        };
-    }
-
-    fn visit_expr_method_call_mut(&mut self, b : &mut syn::ExprMethodCall) {
-        if self.trace_items.contains(&b.method) {
-            let new_method_name = format_ident!("{}_2__", &b.method);
-            let tracer_arg : syn::ExprReference = parse_quote!(&mut trace_data__);
-            let tracer_arg_as_expr : syn::Expr = syn::Expr::Reference(tracer_arg);
-
-            std::mem::replace(&mut b.method, new_method_name);
-            b.args.push(tracer_arg_as_expr);
-        } else {
-            // Don't modify; not supposed to be tracing
-            return
-        }
-    }
-}
-
-
-
-struct TraceMacroState2 {
-    trace_items : HashSet<Ident2>,
-    type_blacklist : HashSet<syn::Path>,
-    item_name : Ident2,
-    fn_arg_infos : Vec<(syn::Pat, syn::Type, Ident2)>,
-    trace_self : bool
-}
-
-impl TraceMacroState2 {
-    pub fn new(trace_self : bool, trace_items : HashSet<Ident2>, _type_blacklist : Option<HashSet<syn::Path>>, f : &ItemFn) -> Self {
-
-        // used to tag the `Op` node as IE `whnf_core ...`
-        let item_name = f.sig.ident.clone();
-
-        // get the name and type of each of the function's arguments
-        // so we can add the code needed to trace them.
-        let fn_arg_infos = f.sig.inputs.iter().filter_map(|item| {
-            match item {
-                syn::FnArg::Typed(syn::PatType { pat, ty, .. }) => {
-                    match pat.as_ref() {
-                        syn::Pat::Ident(pat_ident) => {
-                            let lhs = pat.as_ref().clone();
-                            let rhs = pat_ident.ident.clone();
-                            Some((lhs, ty.as_ref().clone(), rhs))
-                        }
-                        _ => None
+                syn::Pat::Type(pat_type) => {
+                    if type_is_step(pat_type.ty.as_ref()) {
+                        let local_ident = match pat_type.pat.as_ref() {
+                            syn::Pat::Ident(pat_ident) => {
+                                pat_ident.ident.clone()
+                            },
+                            _ => panic!("Not a pat::Ident")
+                        };
+                        (local_ident, _stmt.clone())
+                    } else {
+                        panic!("tracing macro expected the first statement of the block to be a\
+                               local whose type is `Step`, but its type was {:#?}\n", pat_type.ty)
                     }
                 },
-                _ => None
+                _ => panic!("tracing macro expected the first statement of the block to be a\
+                              local of the form `let s : Step = mk_step()...` or `let s = mk_step()`")
             }
-        }).collect::<Vec<(syn::Pat, syn::Type, syn::Ident)>>();
-
-        let  blacklisted_types : Vec<syn::Path> = get_default_blacklist();
-
-        let type_blacklist = {
-            let mut set = _type_blacklist.unwrap_or_else(|| HashSet::new());
-            for elem in blacklisted_types {
-                set.insert(elem);
-            };
-            set
-        };
-
-        TraceMacroState2 {
-            trace_items,
-            type_blacklist,
-            item_name,
-            fn_arg_infos,
-            trace_self
-        }
+        },
+        _ => panic!("tracing macro expected the first statement of the block to be a\
+                     local (IE `let x : usize = 0;`, but instead it got some other type of statement!")
     }
-
-    fn modify_fn_then_visit(&mut self, ifn : &mut syn::ItemFn) {
-        self.swap_function_name(ifn);
-        self.push_trace_data_arg(ifn);
-        self.track_function_block(ifn);
-        self.visit_item_fn_mut(ifn);
-    }
-
-    // unique to `2` code generation; 
-    fn swap_function_name(&self, ifn : &mut syn::ItemFn) {
-        let new_ident = format_ident!("{}_2__", &ifn.sig.ident);
-        std::mem::replace(&mut ifn.sig.ident, new_ident);
-    }
-
-    // also unique to `2` code generation.
-    fn push_trace_data_arg(&self, ifn : &mut syn::ItemFn) {
-        let new_arg : syn::FnArg = parse_quote!(trace_data__ : &mut crate::tracing::TraceData);
-        ifn.sig.inputs.push(new_arg);
-    }
-
-    fn track_function_block(&mut self, ifn : &mut syn::ItemFn) {
-        // Take what used to be the old function body, wrap it in a giant block,
-        // and make that the result of the new outer block.
-
-        let inner_block = ifn.block.clone();
-
-        let inner_block_closure_local : syn::Stmt = parse_quote! {
-            let mut inner_block_closure__ = || #inner_block;
-        };
-
-
-        let mut outer_block_stmts = Vec::new();
-
-        let tracing_imports_stmts : syn::Item = syn::Item::Use(parse_quote! {
-            #[allow(unused_imports)]
-            use crate::tracing::{ TraceData, HasInsertItem };
-        });
-        outer_block_stmts.push(syn::Stmt::Item(tracing_imports_stmts));
-
-
-
-        // Get the function's name so it can be used to label the Op
-        let ident_literal = proc_macro2::Literal::string(&self.item_name.to_string());
-
-        // 2. Get the parent id if it exists.
-        let parent_idx_stmt : Stmt = parse_quote! {
-            let parent_idx : std::option::Option<crate::tracing::OpIdx> = trace_data__.get_current_parent_op();
-        };
-
-        let self_ident_stmt : Stmt = parse_quote! {
-            let self_ident : &'static str = #ident_literal;
-        };
-
-        // 3. Make the new Op item, (gets inserted automatically by the new methods)
-        // and either make it a root item, or set its parent.
-
-        // if None, you know this is supposed to be the root op.
-        // if Some, it's Nonroot
-        let new_op_stmt : Stmt = parse_quote! {
-            let this_op_idx__ : crate::tracing::OpIdx = match parent_idx {
-                Some(x) => trace_data__.new_nonroot_op(self_ident, x),
-                None => panic!("a `.._2__` function should never become a root!")
-                //None => trace_data__.new_root_op(self_ident)
-            };
-        };
-
-        let set_new_parent_stmt : Stmt = parse_quote! {
-            trace_data__.set_parent_as(this_op_idx__);
-        };
-
-        outer_block_stmts.push(parent_idx_stmt);
-        outer_block_stmts.push(self_ident_stmt);
-        outer_block_stmts.push(new_op_stmt);
-        outer_block_stmts.push(set_new_parent_stmt);
-
-
-        if self.trace_self {
-
-            let clone_ident = format_ident!("self_arg_clone__");
-            let item_idx_ident = format_ident!("self_arg_idx__");
-
-            let trace_self_stmt =  parse_quote! {
-                #[allow(unused_variables)]
-                let #item_idx_ident = {
-                    let #clone_ident = self;
-                    let #item_idx_ident = trace_data__.insert_item(#clone_ident);
-                    trace_data__.push_arg(this_op_idx__, #item_idx_ident);
-                    #item_idx_ident
-                };
-            };
-            outer_block_stmts.push(trace_self_stmt);
-        }
-
-
-        // make code to declare/insert function arguments
-        // If the type is something in the blacklist (like offset_cache)
-        // don't trace it.
-        for (p, ty, id) in self.fn_arg_infos.clone().into_iter() {
-            if !(self.type_blacklist.contains(&crate::helpers::get_collect_type(&ty))) {
-               let as_stmt = crate::helpers::make_local_for_arg(p, id, &ty);
-               outer_block_stmts.push(as_stmt);
-            } else {
-                continue
-            }
-        }
-
-        outer_block_stmts.push(inner_block_closure_local);
-
-        let inner_block_result_stmt : syn::Stmt = parse_quote! {
-            let mut inner_block_result__ = inner_block_closure__();
-        };
-        outer_block_stmts.push(inner_block_result_stmt);
-
-        let maybe_reset_parent_stmt : Stmt = parse_quote! {
-            match parent_idx {
-                Some(opid) => trace_data__.set_parent_as(opid),
-                _ => assert!(trace_data__.op_is_root(this_op_idx__))
-            } 
-        };
-        outer_block_stmts.push(maybe_reset_parent_stmt);
-
-
-        let insert_ret_val_stmt : Stmt = parse_quote! {
-            let ret_val_idx__ = trace_data__.push_ret_val(this_op_idx__, inner_block_result__.clone());
-        };
-        outer_block_stmts.push(insert_ret_val_stmt);
-
-
-        let return_result_path : syn::Expr = syn::Expr::Path(parse_quote!(inner_block_result__));
-        outer_block_stmts.push(syn::Stmt::Expr(return_result_path));
-
-        std::mem::replace(&mut ifn.block.stmts, outer_block_stmts);
-    }
-
 }
 
 
-// For the `_2__` function's code generation, the only sorts we want to univerally
-// modify are function and method calls (to change any non-tracking calls that
-// should be tracking to their `_2__` tracking versions)
-impl VisitMut for TraceMacroState2 {
-    fn visit_expr_call_mut(&mut self, b : &mut syn::ExprCall) {
-        match b.func.as_mut() {
-            syn::Expr::Path(expr_path) => {
-                let stock_fn_name = expr_path.path.segments.last().cloned().map(|x| x.ident).expect("visi_expr_call_mut got empty path segment");
-                if self.trace_items.contains(&stock_fn_name) {
-                    let new_fn_name = format_ident!("{}_2__", stock_fn_name);
-                    let tracer_arg : syn::ExprPath = parse_quote!(trace_data__);
-                    let tracer_arg_as_expr : syn::Expr = syn::Expr::Path(tracer_arg);
-
-                   // changes IE `crate::tc::whnf_core` to `crate::tc::whnf_core_2__`
-                    expr_path.path.segments.last_mut().map(|pseg| std::mem::replace(&mut pseg.ident, new_fn_name));
-                    b.args.push(tracer_arg_as_expr);
-
-                } else {
-                    // call to a method that's not supposed to be tracked.
-                    return
-                }
-            },
-            _ => unimplemented!("expected a path for method name in visit_expr_call_mut")
-        };
+fn is_local_stmt(s : &Stmt) -> bool {
+    match s {
+        syn::Stmt::Local(..) => true,
+        _ => false
     }
-
-    fn visit_expr_method_call_mut(&mut self, b : &mut syn::ExprMethodCall) {
-        if self.trace_items.contains(&b.method) {
-            let new_method_name = format_ident!("{}_2__", &b.method);
-            let tracer_arg : syn::Expr = syn::Expr::Path(parse_quote!(trace_data__));
-            std::mem::replace(&mut b.method, new_method_name);
-            b.args.push(tracer_arg);
-        } else {
-            // Don't modify; not supposed to be tracing
-            return
-        }
-    }
-
-
 }
 
+fn change_call_ident(e : &mut syn::Expr) {
+    match e {
+        syn::Expr::Call(syn::ExprCall { func, .. }) => {
+            match func.as_mut() {
+                syn::Expr::Path(syn::ExprPath { path, .. }) => {
+                    let mut last_mut = path.segments.last_mut().expect("Failed to get last path segment in change_call_ident");
+                    let snakecase = crate::helpers::snake_case_name(&last_mut.ident);
+                    let new_snakecase = format_ident!("new_{}", snakecase);
+                    std::mem::replace(&mut last_mut.ident, new_snakecase);
+                },
+                _ => panic!("Expected Path in Expr::Call in change_call_ident")
+            }
+        },
+        _ => panic!("Expected Expr::Call in change_call_ident")
+    }
+}
+
+// Only needs to be mut so at the end we can swap the old
+// x.block.stmts with the new block stmts vec.
+fn add_tracing_to_item_fn(mut trace_attr : TraceAttr, mut item_fn : syn::ItemFn) -> syn::ItemFn {
+
+    let snake_cased = change_call_ident(&mut trace_attr.step);
+
+    let mut closure_block : syn::Block = item_fn.block.as_ref().clone();
+    trace_attr.visit_block_mut(&mut closure_block);
+
+    let this_step_cnstr = &trace_attr.step;
+    let trace_mgr_loc = &trace_attr.tracer_location;
+
+    let return_type : syn::Type = match (&item_fn.sig.output) {
+        syn::ReturnType::Default => parse_quote! { () },
+        syn::ReturnType::Type(_, boxed_type) => boxed_type.as_ref().clone()
+    };
+
+    let step_declar = parse_quote! { let this_step : crate::trace::Step = (#trace_mgr_loc).write().#this_step_cnstr; };
+
+    let rest_as_closure : syn::ExprClosure = parse_quote!(|| #closure_block);
+
+    // instead of `#trace_mgr_loc`
+    // use what you parsed from the `attr` field,
+    // which tells you where you can find the mutable reference to trace_mgr.
+    let mut new_block_stmts : Vec::<syn::Stmt> = vec![
+        // Before closure/function body
+        parse_quote! { use crate::trace::HasInsertItem; },
+        parse_quote! { use crate::trace::Tracer; },
+
+        step_declar,
+
+        parse_quote! { let stack_size_before = (#trace_mgr_loc).read().stack_len() ; },
+        parse_quote! { let ___safety_idx_before = *(this_step.get_safety_idx()); },
+        parse_quote! { (#trace_mgr_loc).write().push(this_step); },
+
+        // Closure + closure.call()
+        parse_quote! { let result____ : #return_type = { #rest_as_closure }(); },
+        
+        // After closure :
+        parse_quote! { let mut write_guard = (#trace_mgr_loc).write(); },
+
+        parse_quote! { let result_idx = result____.clone().insert_item(&mut (*write_guard).item_storage); },
+        parse_quote! { let mut recovered_this_step = write_guard.pop(); },
+        parse_quote! { let this_step_idx = write_guard.next_step_idx(); },
+
+        // Assert that current step's `self_idx` was uninitialized/None
+        // Then replace with the generated index.
+        parse_quote! { assert!(recovered_this_step.get_self_idx().is_none()); },
+        parse_quote! { std::mem::replace(recovered_this_step.get_mut_self_idx(), Some(this_step_idx)); },
+
+        // Add this steps' index to it's parent's list of child steps
+        parse_quote! { write_guard.add_child(this_step_idx, &recovered_this_step); },
+
+        // Asser that the current step's result was uninitialized/None
+        // then initialize it.
+        parse_quote! { assert!(recovered_this_step.get_result().is_none()); },
+        parse_quote! { std::mem::replace(recovered_this_step.get_mut_result(), Some(result_idx)); },
+
+        // Execute the trace() function on this step before dropping it.
+        parse_quote! { write_guard.trace_step(&recovered_this_step); },
+
+        // Assert sanity check invariants
+        parse_quote! { assert_eq!(stack_size_before, write_guard.stack_len()); },
+        parse_quote! { assert_eq!(___safety_idx_before, *(recovered_this_step.get_safety_idx())); },
+   ];
+
+    // push final return statement; parse_quote doesn't want to do this as
+    // a `syn::Stmt::Expr`; complains about no semicolon.
+    new_block_stmts.push(syn::Stmt::Expr(parse_quote! { result____ }));
+
+    std::mem::replace(&mut item_fn.block.stmts, new_block_stmts);
+    item_fn
+}
+
+
+
+
+
+struct TraceAttr {
+    pub tracer_location : syn::Expr,
+    pub step : syn::Expr,
+}
+
+impl TraceAttr {
+    pub fn new(tracer_location : syn::Expr, step : syn::Expr) -> Self {
+        TraceAttr {
+            tracer_location,
+            step
+        }
+    }
+    
+}
+
+impl VisitMut for TraceAttr {
+    fn visit_expr_method_call_mut(&mut self, x : &mut syn::ExprMethodCall) {
+        let target_ident = format_ident!("push_extra");
+
+        let new_arg : syn::Expr = parse_quote!(___safety_idx_before);
+
+        if &x.method == &target_ident {
+            x.args.push(new_arg)
+        }
+    }
+}
+
+// Expr::Field, Expr::Call
+// or
+// Expr::Reference, Expr::Call
+impl Parse for TraceAttr {
+    fn parse(input : ParseStream) -> Result<TraceAttr> {
+        use syn::punctuated::Punctuated;
+        use syn::token::Comma;
+
+        let mut parsed = match Punctuated::<syn::Expr, Comma>::parse_terminated(input) {
+            Ok(p) => p.into_iter(),
+            Err(e) => panic!("Failed to parse Trace Attribute as #[trace(trace_loc, step)]. Error : {}", e)
+        };
+        match (parsed.next(), parsed.next()) {
+            (Some(fst), Some(snd)) => Ok(TraceAttr::new(fst, snd)),
+            (Some(fst), None) => panic!("trace attribute macro needs to know what step to record as its second argument!"),
+            (None, Some(snd)) => panic!("trace attribute macro needs a trace_mgr location as its first argument"),
+            _ => panic!("trace attribute macro needs two arguments; a trace_mgr location, and a step. got neither.")
+        }
+   }
+}
 
 
 #[proc_macro_attribute]
-pub fn tracing(_ : TokenStream, input : TokenStream) -> TokenStream {
-    let trace_list = crate::helpers::read_trace_list();
-
-    let blacklist : Option<HashSet<syn::Path>> = crate::helpers::try_read_type_blacklist();
-
-    let input_clone = input.clone();
-    
-    // becomes decoarted base function
-    let mut fn1 = parse_macro_input!(input_clone as ItemFn);
-
-    // becomes .._2__ function
-    let mut fn2  = parse_macro_input!(input as ItemFn);
-
-    let mut trace_state1 = TraceMacroState1::new(false, trace_list.clone(), blacklist.clone(), &fn1);
-    let mut trace_state2 = TraceMacroState2::new(false, trace_list.clone(), blacklist.clone(), &fn2);
-    trace_state1.add_tracing_then_visit(&mut fn1);
-    trace_state2.modify_fn_then_visit(&mut fn2);
+pub fn trace(_attr : TokenStream, input : TokenStream) -> TokenStream {
+    let attr_contents = parse_macro_input!(_attr as TraceAttr);
+    let original_function = parse_macro_input!(input as syn::ItemFn);
+    let new_token_stream = add_tracing_to_item_fn(attr_contents, original_function);
 
     TokenStream::from(quote! {
-        #fn1
-        #fn2
-    })
-}
-
-#[proc_macro_attribute]
-pub fn tracing_w_self(_ : TokenStream, input : TokenStream) -> TokenStream {
-    let trace_list = crate::helpers::read_trace_list();
-
-    let blacklist : Option<HashSet<syn::Path>> = crate::helpers::try_read_type_blacklist();
-
-    let input_clone = input.clone();
-    
-    // becomes decoarted base function
-    let mut fn1 = parse_macro_input!(input_clone as ItemFn);
-
-    // becomes .._2__ function
-    let mut fn2  = parse_macro_input!(input as ItemFn);
-
-    let mut trace_state1 = TraceMacroState1::new(true, trace_list.clone(), blacklist.clone(), &fn1);
-    let mut trace_state2 = TraceMacroState2::new(true, trace_list.clone(), blacklist.clone(), &fn2);
-    trace_state1.add_tracing_then_visit(&mut fn1);
-    trace_state2.modify_fn_then_visit(&mut fn2);
-
-    TokenStream::from(quote! {
-        #fn1
-        #fn2
+        #new_token_stream
     })
 }
 
 
+
+
+#[proc_macro_attribute]
+pub fn is_step(_attr : TokenStream, input : TokenStream) -> TokenStream {
+
+    let mut as_enum = parse_macro_input!(input as syn::ItemEnum);
+
+    // Collect the set of "short" names to use
+    let short_set = crate::step_derive::collect_short_attrs(&mut as_enum);
+    // Generate function to output short names for printing
+    let short_name_getters = crate::step_derive::mk_name_getters_short(short_set);
+    let name_getters = crate::step_derive::mk_name_getters2(&as_enum);
+    let cnstr_impls = crate::step_derive::derive_cnstrs2(&as_enum);
+
+    TokenStream::from(quote! {
+        #as_enum
+        #short_name_getters
+        #name_getters
+        #(#cnstr_impls)*
+    })
+}
